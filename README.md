@@ -1,10 +1,4 @@
-# ruff-lsp
-
-[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
-[![image](https://img.shields.io/pypi/v/ruff-lsp.svg)](https://pypi.python.org/pypi/ruff-lsp)
-[![image](https://img.shields.io/pypi/l/ruff-lsp.svg)](https://pypi.python.org/pypi/ruff-lsp)
-[![image](https://img.shields.io/pypi/pyversions/ruff-lsp.svg)](https://pypi.python.org/pypi/ruff-lsp)
-[![Actions status](https://github.com/astral-sh/ruff-lsp/workflows/CI/badge.svg)](https://github.com/astral-sh/ruff-lsp/actions)
+# patch-lsp
 
 > [!NOTE]
 >
