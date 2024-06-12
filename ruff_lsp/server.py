@@ -91,7 +91,7 @@ from ruff_lsp.utils import RunResult
 
 logger = logging.getLogger(__name__)
 
-RUFF_LSP_DEBUG = bool(os.environ.get("RUFF_LSP_DEBUG", False))
+RUFF_LSP_DEBUG = bool(os.environ.get("RUFF_LSP_DEBUG", True))
 
 if RUFF_LSP_DEBUG:
     log_file = Path(__file__).parent.parent.joinpath("ruff-lsp.log")
@@ -2025,7 +2025,7 @@ def get_bundle() -> str | None:
 
 
 def start() -> None:
-    LSP_SERVER.start_io()
+    LSP_SERVER.start_ws('localhost', 8000)
 
 
 if __name__ == "__main__":
