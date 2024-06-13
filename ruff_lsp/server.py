@@ -5,6 +5,7 @@ from __future__ import annotations
 from jedi import Project, __version__
 from jedi.api.refactoring import RefactoringError
 from typing import Optional
+import cattrs
 
 import asyncio
 import enum
@@ -19,6 +20,18 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, NamedTuple, Sequence, Union, cast
+
+from dataclasses import dataclass, field, fields, is_dataclass
+from typing import Any, List, Optional, Pattern, Set
+
+from cattrs import Converter
+from cattrs.gen import make_dict_structure_fn, override
+from lsprotocol.types import MarkupKind
+
+if sys.version_info >= (3, 10):
+    light_dataclass = dataclass(kw_only=True, eq=False, match_args=False)
+else:
+    light_dataclass = dataclass(eq=False)
 
 from lsprotocol.types import (
     CODE_ACTION_RESOLVE,
@@ -82,6 +95,7 @@ from lsprotocol.types import (
     TextDocumentFilter_Type1,
     TextEdit,
     WorkspaceEdit,
+    InitializeResult
 )
 from pygls.capabilities import get_capability
 
@@ -91,8 +105,7 @@ from pygls import server, uris, workspace
 from pygls.workspace.position_codec import PositionCodec
 from typing_extensions import Literal, Self, TypedDict, assert_never
 
-
-from ruff_lsp import __version__, utils, jedi_utils, pygls_utils
+from ruff_lsp import __version__, utils
 
 from ruff_lsp.settings import (
     Run,
@@ -103,6 +116,8 @@ from ruff_lsp.settings import (
     lint_run,
 )
 from ruff_lsp.utils import RunResult
+
+from pygls.protocol import LanguageServerProtocol, lsp_method
 
 logger = logging.getLogger(__name__)
 
@@ -137,9 +152,105 @@ CLIENT_CAPABILITIES: dict[str, bool] = {
 }
 
 MAX_WORKERS = 5
-LSP_SERVER = server.LanguageServer(
-    name="Ruff",
+
+class JediLanguageServerProtocol(server.LanguageServerProtocol):
+    """Override some built-in functions."""
+
+    _server: "JediLanguageServer"
+
+    @lsp_method(INITIALIZE)
+    def lsp_initialize(self, params: InitializeParams) -> InitializeResult:
+        """Override built-in initialization.
+
+        Here, we can conditionally register functions to features based
+        on client capabilities and initializationOptions.
+        """
+        server = self._server
+        try:
+            server.initialization_options = (
+                initialization_options_converter.structure(
+                    {}
+                    if params.initialization_options is None
+                    else params.initialization_options,
+                    InitializationOptions,
+                )
+            )
+        except cattrs.BaseValidationError as error:
+            msg = (
+                "Invalid InitializationOptions, using defaults:"
+                f" {cattrs.transform_error(error)}"
+            )
+            server.show_message(msg, msg_type=MessageType.Error)
+            server.show_message_log(msg, msg_type=MessageType.Error)
+            server.initialization_options = InitializationOptions()
+
+        initialization_options = server.initialization_options
+        utils.set_jedi_settings(initialization_options)
+
+        # Configure didOpen, didChange, and didSave
+        # currently need to be configured manually
+        diagnostics = initialization_options.diagnostics
+        did_open = (
+            did_open_diagnostics
+            if diagnostics.enable and diagnostics.did_open
+            else did_open_default
+        )
+        did_change = (
+            did_change_diagnostics
+            if diagnostics.enable and diagnostics.did_change
+            else did_change_default
+        )
+        did_save = (
+            did_save_diagnostics
+            if diagnostics.enable and diagnostics.did_save
+            else did_save_default
+        )
+        did_close = (
+            did_close_diagnostics if diagnostics.enable else did_close_default
+        )
+        server.feature(TEXT_DOCUMENT_DID_OPEN)(did_open)
+        server.feature(TEXT_DOCUMENT_DID_CHANGE)(did_change)
+        server.feature(TEXT_DOCUMENT_DID_SAVE)(did_save)
+        server.feature(TEXT_DOCUMENT_DID_CLOSE)(did_close)
+
+        if server.initialization_options.hover.enable:
+            server.feature(TEXT_DOCUMENT_HOVER)(hover)
+
+        initialize_result: InitializeResult = super().lsp_initialize(params)
+        workspace_options = initialization_options.workspace
+        server.project = (
+            Project(
+                path=server.workspace.root_path,
+                environment_path=workspace_options.environment_path,
+                added_sys_path=workspace_options.extra_paths,
+                smart_sys_path=True,
+                load_unsafe_extensions=False,
+            )
+            if server.workspace.root_path
+            else None
+        )
+        return initialize_result
+
+class JediLanguageServer(server.LanguageServer):
+    """Jedi language server.
+
+    :attr initialization_options: initialized in lsp_initialize from the
+        protocol_cls.
+    :attr project: a Jedi project. This value is created in
+        `JediLanguageServerProtocol.lsp_initialize`.
+    """
+
+    initialization_options: InitializationOptions
+    project: Optional[Project]
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+
+
+LSP_SERVER = JediLanguageServer(
+    name="jedi-language-server",
     version=__version__,
+    protocol_cls=JediLanguageServerProtocol,
     max_workers=MAX_WORKERS,
     notebook_document_sync=NotebookDocumentSyncOptions(
         notebook_selector=[
@@ -154,6 +265,25 @@ LSP_SERVER = server.LanguageServer(
         save=True,
     ),
 )
+
+# LSP_SERVER = server.LanguageServer(
+#     name="Ruff",
+#     version=__version__,
+#     max_workers=MAX_WORKERS,
+#     notebook_document_sync=NotebookDocumentSyncOptions(
+#         notebook_selector=[
+#             NotebookDocumentSyncOptionsNotebookSelectorType2(
+#                 cells=[
+#                     NotebookDocumentSyncOptionsNotebookSelectorType2CellsType(
+#                         language="python"
+#                     )
+#                 ]
+#             )
+#         ],
+#         save=True,
+#     ),
+# )
+
 
 TOOL_MODULE = "ruff.exe" if sys.platform == "win32" else "ruff"
 TOOL_DISPLAY = "Ruff"
@@ -462,7 +592,7 @@ def completion_item_resolve(
 ) -> CompletionItem:
     """Resolves documentation and detail of given completion item."""
     markup_kind = _choose_markup(server)
-    return jedi_utils.lsp_completion_item_resolve(
+    return utils.lsp_completion_item_resolve(
         params, markup_kind=markup_kind
     )
 
@@ -481,8 +611,8 @@ def completion(
     resolve_eagerly = server.initialization_options.completion.resolve_eagerly
     ignore_patterns = server.initialization_options.completion.ignore_patterns
     document = server.workspace.get_text_document(params.text_document.uri)
-    jedi_script = jedi_utils.script(server.project, document)
-    jedi_lines = jedi_utils.line_column(params.position)
+    jedi_script = utils.script(server.project, document)
+    jedi_lines = utils.line_column(params.position)
     completions_jedi_raw = jedi_script.complete(*jedi_lines)
     if not ignore_patterns:
         # A performance optimization. ignore_patterns should usually be empty;
@@ -500,7 +630,7 @@ def completion(
         False,
     )
     markup_kind = _choose_markup(server)
-    is_import_context = jedi_utils.is_import(
+    is_import_context = utils.is_import(
         script_=jedi_script,
         line=jedi_lines[0],
         column=jedi_lines[1],
@@ -508,16 +638,16 @@ def completion(
     enable_snippets = (
         snippet_support and not snippet_disable and not is_import_context
     )
-    char_before_cursor = pygls_utils.char_before_cursor(
+    char_before_cursor = utils.char_before_cursor(
         document=server.workspace.get_text_document(params.text_document.uri),
         position=params.position,
     )
-    jedi_utils.clear_completions_cache()
+    utils.clear_completions_cache()
     # number of characters in the string representation of the total number of
     # completions returned by jedi.
     total_completion_chars = len(str(len(completions_jedi_raw)))
     completion_items = [
-        jedi_utils.lsp_completion_item(
+        utils.lsp_completion_item(
             completion=completion,
             char_before_cursor=char_before_cursor,
             enable_snippets=enable_snippets,
@@ -2112,6 +2242,97 @@ def _choose_markup(server: server.LanguageServer) -> MarkupKind:
         else markup_supported[0]
     )
 
+def _publish_diagnostics(server: JediLanguageServer, uri: str) -> None:
+    """Helper function to publish diagnostics for a file."""
+    # The debounce decorator delays the execution by 1 second
+    # canceling notifications that happen in that interval.
+    # Since this function is executed after a delay, we need to check
+    # whether the document still exists
+    if uri not in server.workspace.documents:
+        return
+
+    doc = server.workspace.get_text_document(uri)
+    diagnostic = utils.lsp_python_diagnostic(uri, doc.source)
+    diagnostics = [diagnostic] if diagnostic else []
+
+    server.publish_diagnostics(uri, diagnostics)
+
+
+# TEXT_DOCUMENT_DID_SAVE
+def did_save_diagnostics(
+    server: JediLanguageServer, params: DidSaveTextDocumentParams
+) -> None:
+    """Actions run on textDocument/didSave: diagnostics."""
+    _publish_diagnostics(server, params.text_document.uri)
+
+
+def did_save_default(
+    server: JediLanguageServer,
+    params: DidSaveTextDocumentParams,
+) -> None:
+    """Actions run on textDocument/didSave: default."""
+
+
+# TEXT_DOCUMENT_DID_CHANGE
+def did_change_diagnostics(
+    server: JediLanguageServer, params: DidChangeTextDocumentParams
+) -> None:
+    """Actions run on textDocument/didChange: diagnostics."""
+    _publish_diagnostics(server, params.text_document.uri)
+
+
+def did_change_default(
+    server: JediLanguageServer,
+    params: DidChangeTextDocumentParams,
+) -> None:
+    """Actions run on textDocument/didChange: default."""
+
+
+# TEXT_DOCUMENT_DID_OPEN
+def did_open_diagnostics(
+    server: JediLanguageServer, params: DidOpenTextDocumentParams
+) -> None:
+    """Actions run on textDocument/didOpen: diagnostics."""
+    _publish_diagnostics(server, params.text_document.uri)
+
+
+def did_open_default(
+    server: JediLanguageServer,
+    params: DidOpenTextDocumentParams,
+) -> None:
+    """Actions run on textDocument/didOpen: default."""
+
+
+# TEXT_DOCUMENT_DID_CLOSE
+def did_close_diagnostics(
+    server: JediLanguageServer, params: DidCloseTextDocumentParams
+) -> None:
+    """Actions run on textDocument/didClose: diagnostics."""
+    server.publish_diagnostics(params.text_document.uri, [])
+
+
+def did_close_default(
+    server: JediLanguageServer,
+    params: DidCloseTextDocumentParams,
+) -> None:
+    """Actions run on textDocument/didClose: default."""
+
+
+def _choose_markup(server: JediLanguageServer) -> MarkupKind:
+    """Returns the preferred or first of supported markup kinds."""
+    markup_preferred = server.initialization_options.markup_kind_preferred
+    markup_supported = get_capability(
+        server.client_capabilities,
+        "text_document.completion.completion_item.documentation_format",
+        [MarkupKind.PlainText],
+    )
+
+    return MarkupKind(
+        markup_preferred
+        if markup_preferred in markup_supported
+        else markup_supported[0]
+    )
+
 
 ###
 # Bundled mode.
@@ -2129,6 +2350,156 @@ def set_bundle(path: str) -> None:
 def get_bundle() -> str | None:
     """Returns the path to the bundled Ruff executable."""
     return _BUNDLED_PATH
+
+
+
+##
+# Initilization Options
+##
+
+@light_dataclass
+class CodeAction:
+    name_extract_variable: str = "jls_extract_var"
+    name_extract_function: str = "jls_extract_def"
+
+
+@light_dataclass
+class Completion:
+    disable_snippets: bool = False
+    resolve_eagerly: bool = False
+    ignore_patterns: List[Pattern[str]] = field(default_factory=list)
+
+
+@light_dataclass
+class Diagnostics:
+    enable: bool = True
+    did_open: bool = True
+    did_save: bool = True
+    did_change: bool = True
+
+
+@light_dataclass
+class HoverDisableOptions:
+    all: bool = False
+    names: Set[str] = field(default_factory=set)
+    full_names: Set[str] = field(default_factory=set)
+
+
+@light_dataclass
+class HoverDisable:
+    """All Attributes have _ appended to avoid syntax conflicts.
+
+    For example, the keyword class would have required a special case.
+    To get around this, I decided it's simpler to always assume an
+    underscore at the end.
+    """
+
+    keyword_: HoverDisableOptions = field(default_factory=HoverDisableOptions)
+    module_: HoverDisableOptions = field(default_factory=HoverDisableOptions)
+    class_: HoverDisableOptions = field(default_factory=HoverDisableOptions)
+    instance_: HoverDisableOptions = field(default_factory=HoverDisableOptions)
+    function_: HoverDisableOptions = field(default_factory=HoverDisableOptions)
+    param_: HoverDisableOptions = field(default_factory=HoverDisableOptions)
+    path_: HoverDisableOptions = field(default_factory=HoverDisableOptions)
+    property_: HoverDisableOptions = field(default_factory=HoverDisableOptions)
+    statement_: HoverDisableOptions = field(
+        default_factory=HoverDisableOptions
+    )
+
+
+@light_dataclass
+class Hover:
+    enable: bool = True
+    disable: HoverDisable = field(default_factory=HoverDisable)
+
+
+@light_dataclass
+class JediSettings:
+    auto_import_modules: List[str] = field(default_factory=list)
+    case_insensitive_completion: bool = True
+    debug: bool = False
+
+
+@light_dataclass
+class Symbols:
+    ignore_folders: List[str] = field(
+        default_factory=lambda: [".nox", ".tox", ".venv", "__pycache__"]
+    )
+    max_symbols: int = 20
+
+
+@light_dataclass
+class Workspace:
+    environment_path: Optional[str] = None
+    extra_paths: List[str] = field(default_factory=list)
+    symbols: Symbols = field(default_factory=Symbols)
+
+
+@light_dataclass
+class InitializationOptions:
+    code_action: CodeAction = field(default_factory=CodeAction)
+    completion: Completion = field(default_factory=Completion)
+    diagnostics: Diagnostics = field(default_factory=Diagnostics)
+    hover: Hover = field(default_factory=Hover)
+    jedi_settings: JediSettings = field(default_factory=JediSettings)
+    markup_kind_preferred: Optional[MarkupKind] = None
+    workspace: Workspace = field(default_factory=Workspace)
+
+
+initialization_options_converter = Converter()
+
+WEIRD_NAMES = {
+    "keyword_": "keyword",
+    "module_": "module",
+    "class_": "class",
+    "instance_": "instance",
+    "function_": "function",
+    "param_": "param",
+    "path_": "path",
+    "property_": "property",
+    "statement_ ": "statement",
+}
+
+
+def convert_class_keys(string: str) -> str:
+    """Convert from snake_case to camelCase.
+
+    Also handles random special cases for keywords.
+    """
+    if string in WEIRD_NAMES:
+        return WEIRD_NAMES[string]
+    return "".join(
+        word.capitalize() if idx > 0 else word
+        for idx, word in enumerate(string.split("_"))
+    )
+
+
+def structure(cls: type) -> Any:
+    """Hook to convert names when marshalling initialization_options."""
+    return make_dict_structure_fn(
+        cls,
+        initialization_options_converter,
+        **{  # type: ignore[arg-type]
+            a.name: override(rename=convert_class_keys(a.name))
+            for a in fields(cls)
+        },
+    )
+
+
+initialization_options_converter.register_structure_hook_factory(
+    is_dataclass, structure
+)
+
+
+initialization_options_converter.register_structure_hook_factory(
+    lambda x: x == Pattern[str],
+    lambda _: lambda x, _: re.compile(x),
+)
+
+initialization_options_converter.register_unstructure_hook_factory(
+    lambda x: x == Pattern[str],
+    lambda _: lambda x: x.pattern,
+)
 
 
 ###
