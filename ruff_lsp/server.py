@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from jedi import Project, __version__
+from jedi.api.refactoring import RefactoringError
+from typing import Optional
+
 import asyncio
 import enum
 import json
@@ -18,12 +22,14 @@ from typing import Any, List, NamedTuple, Sequence, Union, cast
 
 from lsprotocol.types import (
     CODE_ACTION_RESOLVE,
+    COMPLETION_ITEM_RESOLVE,
     INITIALIZE,
     NOTEBOOK_DOCUMENT_DID_CHANGE,
     NOTEBOOK_DOCUMENT_DID_CLOSE,
     NOTEBOOK_DOCUMENT_DID_OPEN,
     NOTEBOOK_DOCUMENT_DID_SAVE,
     TEXT_DOCUMENT_CODE_ACTION,
+    TEXT_DOCUMENT_COMPLETION,
     TEXT_DOCUMENT_DID_CHANGE,
     TEXT_DOCUMENT_DID_CLOSE,
     TEXT_DOCUMENT_DID_OPEN,
@@ -38,6 +44,10 @@ from lsprotocol.types import (
     CodeActionOptions,
     CodeActionParams,
     CodeDescription,
+    CompletionItem,
+    CompletionList,
+    CompletionOptions,
+    CompletionParams,
     Diagnostic,
     DiagnosticSeverity,
     DiagnosticTag,
@@ -73,12 +83,17 @@ from lsprotocol.types import (
     TextEdit,
     WorkspaceEdit,
 )
+from pygls.capabilities import get_capability
+
+
 from packaging.specifiers import SpecifierSet, Version
 from pygls import server, uris, workspace
 from pygls.workspace.position_codec import PositionCodec
 from typing_extensions import Literal, Self, TypedDict, assert_never
 
-from ruff_lsp import __version__, utils
+
+from ruff_lsp import __version__, utils, jedi_utils, pygls_utils
+
 from ruff_lsp.settings import (
     Run,
     UserSettings,
@@ -434,6 +449,88 @@ def _create_single_cell_notebook_json(source: str) -> str:
                 }
             ],
         }
+    )
+
+
+###
+# Jedi Autocomplete.
+###
+
+@LSP_SERVER.feature(COMPLETION_ITEM_RESOLVE)
+def completion_item_resolve(
+    server: server.LanguageServer, params: CompletionItem
+) -> CompletionItem:
+    """Resolves documentation and detail of given completion item."""
+    markup_kind = _choose_markup(server)
+    return jedi_utils.lsp_completion_item_resolve(
+        params, markup_kind=markup_kind
+    )
+
+
+@LSP_SERVER.feature(
+    TEXT_DOCUMENT_COMPLETION,
+    CompletionOptions(
+        trigger_characters=[".", "'", '"'], resolve_provider=True
+    ),
+)
+def completion(
+    server: server.LanguageServer, params: CompletionParams
+) -> Optional[CompletionList]:
+    """Returns completion items."""
+    snippet_disable = server.initialization_options.completion.disable_snippets
+    resolve_eagerly = server.initialization_options.completion.resolve_eagerly
+    ignore_patterns = server.initialization_options.completion.ignore_patterns
+    document = server.workspace.get_text_document(params.text_document.uri)
+    jedi_script = jedi_utils.script(server.project, document)
+    jedi_lines = jedi_utils.line_column(params.position)
+    completions_jedi_raw = jedi_script.complete(*jedi_lines)
+    if not ignore_patterns:
+        # A performance optimization. ignore_patterns should usually be empty;
+        # this special case avoid repeated filter checks for the usual case.
+        completions_jedi = (comp for comp in completions_jedi_raw)
+    else:
+        completions_jedi = (
+            comp
+            for comp in completions_jedi_raw
+            if not any(i.match(comp.name) for i in ignore_patterns)
+        )
+    snippet_support = get_capability(
+        server.client_capabilities,
+        "text_document.completion.completion_item.snippet_support",
+        False,
+    )
+    markup_kind = _choose_markup(server)
+    is_import_context = jedi_utils.is_import(
+        script_=jedi_script,
+        line=jedi_lines[0],
+        column=jedi_lines[1],
+    )
+    enable_snippets = (
+        snippet_support and not snippet_disable and not is_import_context
+    )
+    char_before_cursor = pygls_utils.char_before_cursor(
+        document=server.workspace.get_text_document(params.text_document.uri),
+        position=params.position,
+    )
+    jedi_utils.clear_completions_cache()
+    # number of characters in the string representation of the total number of
+    # completions returned by jedi.
+    total_completion_chars = len(str(len(completions_jedi_raw)))
+    completion_items = [
+        jedi_utils.lsp_completion_item(
+            completion=completion,
+            char_before_cursor=char_before_cursor,
+            enable_snippets=enable_snippets,
+            resolve_eagerly=resolve_eagerly,
+            markup_kind=markup_kind,
+            sort_append_text=str(count).zfill(total_completion_chars),
+        )
+        for count, completion in enumerate(completions_jedi)
+    ]
+    return (
+        CompletionList(is_incomplete=False, items=completion_items)
+        if completion_items
+        else None
     )
 
 
@@ -1999,6 +2096,21 @@ def log_always(message: str) -> None:
     LSP_SERVER.show_message_log(message, MessageType.Info)
     if os.getenv("LS_SHOW_NOTIFICATION", "off") in ["always"]:
         LSP_SERVER.show_message(message, MessageType.Info)
+
+def _choose_markup(server: server.LanguageServer) -> MarkupKind:
+    """Returns the preferred or first of supported markup kinds."""
+    markup_preferred = server.initialization_options.markup_kind_preferred
+    markup_supported = get_capability(
+        server.client_capabilities,
+        "text_document.completion.completion_item.documentation_format",
+        [MarkupKind.PlainText],
+    )
+
+    return MarkupKind(
+        markup_preferred
+        if markup_preferred in markup_supported
+        else markup_supported[0]
+    )
 
 
 ###
